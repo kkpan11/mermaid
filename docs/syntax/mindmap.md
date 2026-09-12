@@ -304,7 +304,7 @@ From version 9.4.0 you can simplify this code to:
 
 ```html
 <script type="module">
-  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@12/dist/mermaid.esm.min.mjs';
 </script>
 ```
 
@@ -314,3 +314,22 @@ You can also refer the [implementation in the live editor](https://github.com/me
 cspell:locale en,en-gb
 cspell:ignore Buzan
 --->
+
+## Layouts
+
+Mermaid also supports a Tidy Tree layout for mindmaps.
+
+```
+---
+config:
+  layout: tidy-tree
+---
+mindmap
+root((mindmap is a long thing))
+  A
+  B
+  C
+  D
+```
+
+Instructions to add and register tidy-tree layout are present in [Tidy Tree Configuration](/config/tidy-tree)

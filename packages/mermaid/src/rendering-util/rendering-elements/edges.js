@@ -1,9 +1,15 @@
 import { getConfig } from '../../diagram-api/diagramAPI.js';
-import { evaluate } from '../../diagrams/common/common.js';
+import { getEffectiveHtmlLabels } from '../../config.js';
 import { log } from '../../logger.js';
 import { createText } from '../createText.js';
-import utils from '../../utils.js';
-import { getLineFunctionsWithOffset } from '../../utils/lineWithOffset.js';
+import fastdom from '../fastdom.js';
+import { computeLabelTransform } from '../labelTransform.js';
+import utils, { handleUndefinedAttr } from '../../utils.js';
+import {
+  getLineFunctionsWithOffset,
+  markerOffsets,
+  markerOffsets2,
+} from '../../utils/lineWithOffset.js';
 import { getSubGraphTitleMargins } from '../../utils/subGraphTitleMargins.js';
 
 import {
@@ -25,49 +31,103 @@ import {
 import rough from 'roughjs';
 import createLabel from './createLabel.js';
 import { addEdgeMarkers } from './edgeMarker.ts';
-import { isLabelStyle } from './shapes/handDrawnShapeStyles.js';
+import { isLabelStyle, styles2String } from './shapes/handDrawnShapeStyles.js';
 
-const edgeLabels = new Map();
-const terminalLabels = new Map();
+/**
+ * Resolve the effective curve type for an edge.
+ * If edge.curve is a string (e.g. 'rounded', 'linear'), use it directly.
+ * Otherwise (undefined, null, or a D3 CurveFactory function), fall back to config.
+ * @param {*} edgeCurve - The edge.curve value (string, function, or undefined/null)
+ * @returns {string|undefined} - The resolved curve type string
+ */
+export const resolveEdgeCurveType = (edgeCurve) => {
+  return typeof edgeCurve === 'string' ? edgeCurve : getConfig()?.flowchart?.curve;
+};
+
+export const edgeLabels = new Map();
+export const terminalLabels = new Map();
 
 export const clear = () => {
   edgeLabels.clear();
   terminalLabels.clear();
 };
 
+export const hasEdgeLabel = (edge) =>
+  Boolean(
+    edge.label ||
+      edge.startLabelLeft ||
+      edge.startLabelRight ||
+      edge.endLabelLeft ||
+      edge.endLabelRight
+  );
+
 export const getLabelStyles = (styleArray) => {
-  let styles = styleArray ? styleArray.reduce((acc, style) => acc + ';' + style, '') : '';
-  return styles;
+  if (!styleArray) {
+    return '';
+  }
+  if (typeof styleArray === 'string') {
+    return styleArray;
+  }
+  return styleArray.reduce((acc, style) => acc + ';' + style, '');
 };
 
 export const insertEdgeLabel = async (elem, edge) => {
-  let useHtmlLabels = evaluate(getConfig().flowchart.htmlLabels);
-
-  const labelElement = await createText(elem, edge.label, {
-    style: getLabelStyles(edge.labelStyle),
-    useHtmlLabels,
-    addSvgBackground: true,
-    isNode: false,
-  });
-  log.info('abc82', edge, edge.labelType);
+  const config = getConfig();
+  let useHtmlLabels = getEffectiveHtmlLabels(config);
+  const { labelStyles } = styles2String(edge);
+  edge.labelStyle = labelStyles;
 
   // Create outer g, edgeLabel, this will be positioned after graph layout
   const edgeLabel = elem.insert('g').attr('class', 'edgeLabel');
 
   // Create inner g, label, this will be positioned now for centering the text
-  const label = edgeLabel.insert('g').attr('class', 'label');
+  const label = edgeLabel.insert('g').attr('class', 'label').attr('data-id', edge.id);
+
+  const isMarkdown = edge.labelType === 'markdown';
+  const markdownWidth = undefined; // Use default width for markdown labels
+  const labelElement = await createText(
+    elem,
+    edge.label,
+    {
+      style: getLabelStyles(edge.labelStyle),
+      useHtmlLabels,
+      addSvgBackground: true,
+      isNode: false,
+      markdown: isMarkdown,
+      // Plain text edge labels should auto-wrap, markdown edge labels respect markdownAutoWrap config
+      width: isMarkdown ? markdownWidth : undefined,
+    },
+    config
+  );
+
   label.node().appendChild(labelElement);
+  log.info('abc82', edge, edge.labelType);
 
   // Center the label
-  let bbox = labelElement.getBBox();
+  /** @type {DOMRect} */
+  let bbox;
+  /** @type {DOMRect} */
+  let transformBbox;
   if (useHtmlLabels) {
     const div = labelElement.children[0];
     const dv = select(labelElement);
-    bbox = div.getBoundingClientRect();
+    bbox = await fastdom.measure(() => div.getBoundingClientRect());
+    transformBbox = bbox;
     dv.attr('width', bbox.width);
     dv.attr('height', bbox.height);
+  } else {
+    // For SVG labels, use text element's bbox so the text is centered on the edge
+    const textEl = select(labelElement).select('text').node();
+    await fastdom.measure(() => {
+      bbox = labelElement.getBBox();
+      if (textEl && typeof textEl.getBBox === 'function') {
+        transformBbox = textEl.getBBox();
+      } else {
+        transformBbox = bbox;
+      }
+    });
   }
-  label.attr('transform', 'translate(' + -bbox.width / 2 + ', ' + -bbox.height / 2 + ')');
+  label.attr('transform', computeLabelTransform(transformBbox, useHtmlLabels));
 
   // Make element accessible by id for positioning
   edgeLabels.set(edge.id, edgeLabel);
@@ -79,15 +139,25 @@ export const insertEdgeLabel = async (elem, edge) => {
   let fo;
   if (edge.startLabelLeft) {
     // Create the actual text element
-    const startLabelElement = await createLabel(
-      edge.startLabelLeft,
-      getLabelStyles(edge.labelStyle)
-    );
     const startEdgeLabelLeft = elem.insert('g').attr('class', 'edgeTerminals');
     const inner = startEdgeLabelLeft.insert('g').attr('class', 'inner');
-    fo = inner.node().appendChild(startLabelElement);
-    const slBox = startLabelElement.getBBox();
-    inner.attr('transform', 'translate(' + -slBox.width / 2 + ', ' + -slBox.height / 2 + ')');
+    const startLabelElement = await createLabel(
+      inner,
+      edge.startLabelLeft,
+      getLabelStyles(edge.labelStyle) || '',
+      false,
+      false
+    );
+    fo = startLabelElement;
+    let slBox = startLabelElement.getBBox();
+    if (useHtmlLabels) {
+      const div = startLabelElement.children[0];
+      const dv = select(startLabelElement);
+      slBox = div.getBoundingClientRect();
+      dv.attr('width', slBox.width);
+      dv.attr('height', slBox.height);
+    }
+    inner.attr('transform', computeLabelTransform(slBox, useHtmlLabels));
     if (!terminalLabels.get(edge.id)) {
       terminalLabels.set(edge.id, {});
     }
@@ -95,17 +165,25 @@ export const insertEdgeLabel = async (elem, edge) => {
     setTerminalWidth(fo, edge.startLabelLeft);
   }
   if (edge.startLabelRight) {
-    // Create the actual text element
-    const startLabelElement = await createLabel(
-      edge.startLabelRight,
-      getLabelStyles(edge.labelStyle)
-    );
     const startEdgeLabelRight = elem.insert('g').attr('class', 'edgeTerminals');
     const inner = startEdgeLabelRight.insert('g').attr('class', 'inner');
-    fo = startEdgeLabelRight.node().appendChild(startLabelElement);
-    inner.node().appendChild(startLabelElement);
-    const slBox = startLabelElement.getBBox();
-    inner.attr('transform', 'translate(' + -slBox.width / 2 + ', ' + -slBox.height / 2 + ')');
+    const startLabelElement = await createLabel(
+      inner,
+      edge.startLabelRight,
+      getLabelStyles(edge.labelStyle) || '',
+      false,
+      false
+    );
+    fo = startLabelElement;
+    let slBox = startLabelElement.getBBox();
+    if (useHtmlLabels) {
+      const div = startLabelElement.children[0];
+      const dv = select(startLabelElement);
+      slBox = div.getBoundingClientRect();
+      dv.attr('width', slBox.width);
+      dv.attr('height', slBox.height);
+    }
+    inner.attr('transform', computeLabelTransform(slBox, useHtmlLabels));
 
     if (!terminalLabels.get(edge.id)) {
       terminalLabels.set(edge.id, {});
@@ -114,15 +192,26 @@ export const insertEdgeLabel = async (elem, edge) => {
     setTerminalWidth(fo, edge.startLabelRight);
   }
   if (edge.endLabelLeft) {
-    // Create the actual text element
-    const endLabelElement = await createLabel(edge.endLabelLeft, getLabelStyles(edge.labelStyle));
     const endEdgeLabelLeft = elem.insert('g').attr('class', 'edgeTerminals');
+    // TODO: Remove? `inner` is not used
     const inner = endEdgeLabelLeft.insert('g').attr('class', 'inner');
-    fo = inner.node().appendChild(endLabelElement);
-    const slBox = endLabelElement.getBBox();
-    inner.attr('transform', 'translate(' + -slBox.width / 2 + ', ' + -slBox.height / 2 + ')');
-
-    endEdgeLabelLeft.node().appendChild(endLabelElement);
+    const endLabelElement = await createLabel(
+      endEdgeLabelLeft,
+      edge.endLabelLeft,
+      getLabelStyles(edge.labelStyle) || '',
+      false,
+      false
+    );
+    fo = endLabelElement;
+    let slBox = endLabelElement.getBBox();
+    if (useHtmlLabels) {
+      const div = endLabelElement.children[0];
+      const dv = select(endLabelElement);
+      slBox = div.getBoundingClientRect();
+      dv.attr('width', slBox.width);
+      dv.attr('height', slBox.height);
+    }
+    inner.attr('transform', computeLabelTransform(slBox, useHtmlLabels));
 
     if (!terminalLabels.get(edge.id)) {
       terminalLabels.set(edge.id, {});
@@ -131,16 +220,28 @@ export const insertEdgeLabel = async (elem, edge) => {
     setTerminalWidth(fo, edge.endLabelLeft);
   }
   if (edge.endLabelRight) {
-    // Create the actual text element
-    const endLabelElement = await createLabel(edge.endLabelRight, getLabelStyles(edge.labelStyle));
     const endEdgeLabelRight = elem.insert('g').attr('class', 'edgeTerminals');
+    // TODO: Remove? `inner` is not used
     const inner = endEdgeLabelRight.insert('g').attr('class', 'inner');
 
-    fo = inner.node().appendChild(endLabelElement);
-    const slBox = endLabelElement.getBBox();
-    inner.attr('transform', 'translate(' + -slBox.width / 2 + ', ' + -slBox.height / 2 + ')');
+    const endLabelElement = await createLabel(
+      endEdgeLabelRight,
+      edge.endLabelRight,
+      getLabelStyles(edge.labelStyle) || '',
+      false,
+      false
+    );
+    fo = endLabelElement;
+    let slBox = endLabelElement.getBBox();
+    if (useHtmlLabels) {
+      const div = endLabelElement.children[0];
+      const dv = select(endLabelElement);
+      slBox = div.getBoundingClientRect();
+      dv.attr('width', slBox.width);
+      dv.attr('height', slBox.height);
+    }
+    inner.attr('transform', computeLabelTransform(slBox, useHtmlLabels));
 
-    endEdgeLabelRight.node().appendChild(endLabelElement);
     if (!terminalLabels.get(edge.id)) {
       terminalLabels.set(edge.id, {});
     }
@@ -155,7 +256,7 @@ export const insertEdgeLabel = async (elem, edge) => {
  * @param {any} value
  */
 function setTerminalWidth(fo, value) {
-  if (getConfig().flowchart.htmlLabels && fo) {
+  if (getEffectiveHtmlLabels(getConfig()) && fo) {
     fo.style.width = value.length * 9 + 'px';
     fo.style.height = '12px';
   }
@@ -239,6 +340,33 @@ export const positionEdgeLabel = (edge, paths) => {
     }
     el.attr('transform', `translate(${x}, ${y})`);
   }
+};
+
+// Swimlanes-only helper, kept module-private: it self-gates to `-to-label` edges
+// (the swimlanes edge-label waypoint mechanism) and is called only from insertEdge's
+// `layout === 'swimlane'` branch, so it is a no-op for every other layout.
+const orthogonalizeToLabelClippedPoints = (edge, points) => {
+  if (!edge?.isLabelEdge || !edge?.id?.endsWith('-to-label') || !Array.isArray(points)) {
+    return points;
+  }
+
+  if (points.length !== 2) {
+    return points;
+  }
+
+  const [start, end] = points;
+  const dx = Math.abs(end.x - start.x);
+  const dy = Math.abs(end.y - start.y);
+
+  if (dx < 1e-3 || dy < 1e-3) {
+    return points;
+  }
+
+  if (dy >= dx) {
+    return [start, { x: start.x, y: end.y }, end];
+  }
+
+  return [start, { x: end.x, y: start.y }, end];
 };
 
 const outsideNode = (node, point) => {
@@ -439,8 +567,45 @@ const fixCorners = function (lineData) {
   return newLineData;
 };
 
-export const insertEdge = function (elem, edge, clusterDb, diagramType, startNode, endNode, id) {
-  const { handDrawnSeed } = getConfig();
+const generateDashArray = (len, oValueS, oValueE) => {
+  const middleLength = len - oValueS - oValueE;
+  const dashLength = 2; // Length of each dash
+  const gapLength = 2; // Length of each gap
+  const dashGapPairLength = dashLength + gapLength;
+
+  // Calculate number of complete dash-gap pairs that can fit.
+  // Clamp to a non-negative, finite integer: a short edge (len < the combined
+  // marker offsets) makes this negative, and a degenerate path makes
+  // getTotalLength() return NaN — either would throw "RangeError: Invalid array
+  // length" from Array(numberOfPairs) below.
+  const rawPairs = Math.floor(middleLength / dashGapPairLength);
+  const numberOfPairs = Number.isFinite(rawPairs) ? Math.max(0, rawPairs) : 0;
+
+  // Generate the middle pattern array
+  const middlePattern = Array(numberOfPairs).fill(`${dashLength} ${gapLength}`).join(' ');
+
+  // Combine all parts
+  const dashArray = `0 ${oValueS} ${middlePattern} ${oValueE}`;
+
+  return dashArray;
+};
+
+export const insertEdge = function (
+  elem,
+  edge,
+  clusterDb,
+  diagramType,
+  startNode,
+  endNode,
+  diagramId,
+  skipIntersect = false
+) {
+  if (!diagramId) {
+    throw new Error(
+      `insertEdge: missing diagramId for edge "${edge.id}" — edge IDs require a diagram prefix for uniqueness`
+    );
+  }
+  const { handDrawnSeed, layout } = getConfig();
   let points = edge.points;
   let pointsHasChanged = false;
   const tail = startNode;
@@ -453,20 +618,52 @@ export const insertEdge = function (elem, edge, clusterDb, diagramType, startNod
     edgeClassStyles.push(edge.cssCompiledStyles[key]);
   }
 
-  if (head.intersect && tail.intersect) {
+  // Edge endpoint clipping. The swimlanes layout produces orthogonal edges whose
+  // axis-aligned entry/exit segments must be preserved, so it uses a dedicated
+  // boundary-clipping path. Every other layout (dagre, ELK, …) keeps the original
+  // clipping below, so their edge ports are unaffected by swimlanes.
+  if (layout === 'swimlane') {
+    if (head.intersect && tail.intersect && Array.isArray(points) && points.length >= 2) {
+      if (points.length === 2) {
+        // Simple straight edge: just clip the two endpoints to the node boundaries.
+        points = [tail.intersect(points[0]), head.intersect(points[1])];
+      } else {
+        // For multi-segment paths, keep the inner bend points and just adjust the entry/exit
+        // segments near the nodes.
+        const innerPoints = points.slice(1, -1);
+        const firstInner = innerPoints[0];
+        const lastInner = innerPoints[innerPoints.length - 1];
+        const TOLERANCE = 0.5;
+        const lastIsPinned =
+          Math.abs(points[points.length - 1].x - lastInner.x) < TOLERANCE &&
+          Math.abs(points[points.length - 1].y - lastInner.y) < TOLERANCE;
+
+        const newFirst = tail.intersect(firstInner);
+        const newLast = lastIsPinned ? lastInner : head.intersect(lastInner);
+
+        // When the boundary intersection lands ~on the inner point, skip it to
+        // avoid a zero-length final segment (keeps the entry/exit segment orthogonal).
+        const lastIsDuplicate =
+          Math.abs(newLast.x - lastInner.x) < TOLERANCE &&
+          Math.abs(newLast.y - lastInner.y) < TOLERANCE;
+        const firstIsDuplicate =
+          Math.abs(newFirst.x - firstInner.x) < TOLERANCE &&
+          Math.abs(newFirst.y - firstInner.y) < TOLERANCE;
+
+        const startPoints = firstIsDuplicate ? [] : [newFirst];
+        const endPoints = lastIsDuplicate ? [] : [newLast];
+
+        points = [...startPoints, ...innerPoints, ...endPoints];
+      }
+    }
+    points = orthogonalizeToLabelClippedPoints(edge, points);
+  } else if (head.intersect && tail.intersect && !skipIntersect) {
+    // Original clipping — unchanged for dagre / ELK / every non-swimlanes layout.
     points = points.slice(1, edge.points.length - 1);
     points.unshift(tail.intersect(points[0]));
-    log.debug(
-      'Last point APA12',
-      edge.start,
-      '-->',
-      edge.end,
-      points[points.length - 1],
-      head,
-      head.intersect(points[points.length - 1])
-    );
     points.push(head.intersect(points[points.length - 1]));
   }
+  const pointsStr = btoa(JSON.stringify(points));
   if (edge.toCluster) {
     log.info('to cluster abc88', clusterDb.get(edge.toCluster));
     points = cutPathAtIntersect(edge.points, clusterDb.get(edge.toCluster).node);
@@ -486,10 +683,15 @@ export const insertEdge = function (elem, edge, clusterDb, diagramType, startNod
   }
 
   let lineData = points.filter((p) => !Number.isNaN(p.y));
-  lineData = fixCorners(lineData);
-  let curve = curveBasis;
-  curve = curveLinear;
-  switch (edge.curve) {
+  // Resolve curve type: use edge.curve if it's a string, otherwise fall back to config default
+  const edgeCurveType = resolveEdgeCurveType(edge.curve);
+  // Apply fixCorners for non-rounded curves to pre-round right-angle corners
+  // (rounded curve type uses generateRoundedPath instead)
+  if (edgeCurveType !== 'rounded') {
+    lineData = fixCorners(lineData);
+  }
+  let curve = curveLinear;
+  switch (edgeCurveType) {
     case 'linear':
       curve = curveLinear;
       break;
@@ -526,6 +728,9 @@ export const insertEdge = function (elem, edge, clusterDb, diagramType, startNod
     case 'stepBefore':
       curve = curveStepBefore;
       break;
+    case 'rounded':
+      curve = curveLinear;
+      break;
     default:
       curve = curveBasis;
   }
@@ -561,10 +766,22 @@ export const insertEdge = function (elem, edge, clusterDb, diagramType, startNod
       strokeClasses += ' edge-pattern-solid';
   }
   let svgPath;
-  let linePath = lineFunction(lineData);
-  const edgeStyles = Array.isArray(edge.style) ? edge.style : edge.style ? [edge.style] : [];
+  let linePath =
+    edgeCurveType === 'rounded'
+      ? generateRoundedPath(applyMarkerOffsetsToPoints(lineData, edge), 5)
+      : lineFunction(lineData);
+  const edgeStyles = Array.isArray(edge.style) ? edge.style : [edge.style];
   let strokeColor = edgeStyles.find((style) => style?.startsWith('stroke:'));
 
+  let animationClass = '';
+  if (edge.animate) {
+    animationClass = 'edge-animation-fast';
+  }
+  if (edge.animation) {
+    animationClass = 'edge-animation-' + edge.animation;
+  }
+
+  let animatedEdge = false;
   if (edge.look === 'handDrawn') {
     const rc = rough.svg(elem);
     Object.assign([], lineData);
@@ -578,8 +795,14 @@ export const insertEdge = function (elem, edge, clusterDb, diagramType, startNod
 
     svgPath = select(svgPathNode)
       .select('path')
-      .attr('id', edge.id)
-      .attr('class', ' ' + strokeClasses + (edge.classes ? ' ' + edge.classes : ''))
+      .attr('id', `${diagramId}-${edge.id}`)
+      .attr(
+        'class',
+        ' ' +
+          strokeClasses +
+          (edge.classes ? ' ' + edge.classes : '') +
+          (animationClass ? ' ' + animationClass : '')
+      )
       .attr('style', edgeStyles ? edgeStyles.reduce((acc, style) => acc + ';' + style, '') : '');
     let d = svgPath.attr('d');
     svgPath.attr('d', d);
@@ -587,29 +810,57 @@ export const insertEdge = function (elem, edge, clusterDb, diagramType, startNod
   } else {
     const stylesFromClasses = edgeClassStyles.join(';');
     const styles = edgeStyles ? edgeStyles.reduce((acc, style) => acc + style + ';', '') : '';
-    let animationClass = '';
-    if (edge.animate) {
-      animationClass = ' edge-animation-fast';
-    }
-    if (edge.animation) {
-      animationClass = ' edge-animation-' + edge.animation;
-    }
 
-    const pathStyle = stylesFromClasses ? stylesFromClasses + ';' + styles + ';' : styles;
+    const pathStyle =
+      (stylesFromClasses ? stylesFromClasses + ';' + styles + ';' : styles) +
+      ';' +
+      (edgeStyles ? edgeStyles.reduce((acc, style) => acc + ';' + style, '') : '');
     svgPath = elem
       .append('path')
       .attr('d', linePath)
-      .attr('id', edge.id)
+      .attr('id', `${diagramId}-${edge.id}`)
       .attr(
         'class',
-        ' ' + strokeClasses + (edge.classes ? ' ' + edge.classes : '') + (animationClass ?? '')
+        ' ' +
+          strokeClasses +
+          (edge.classes ? ' ' + edge.classes : '') +
+          (animationClass ? ' ' + animationClass : '')
       )
       .attr('style', pathStyle);
+
+    //eslint-disable-next-line @typescript-eslint/prefer-regexp-exec
     strokeColor = pathStyle.match(/stroke:([^;]+)/)?.[1];
+
+    // Possible fix to remove eslint-disable-next-line
+    //strokeColor = /stroke:([^;]+)/.exec(pathStyle)?.[1];
+
+    animatedEdge =
+      edge.animate === true || !!edge.animation || stylesFromClasses.includes('animation');
+    const pathNode = svgPath.node();
+    const len = typeof pathNode.getTotalLength === 'function' ? pathNode.getTotalLength() : 0;
+    const oValueS = markerOffsets2[edge.arrowTypeStart] || 0;
+    const oValueE = markerOffsets2[edge.arrowTypeEnd] || 0;
+
+    if (edge.look === 'neo' && !animatedEdge) {
+      const dashArray =
+        edge.pattern === 'dotted' || edge.pattern === 'dashed'
+          ? generateDashArray(len, oValueS, oValueE)
+          : `0 ${oValueS} ${len - oValueS - oValueE} ${oValueE}`;
+
+      // No offset needed because we already start with a zero-length dash that effectively sets us up for a gap at the start.
+      const mOffset = `stroke-dasharray: ${dashArray}; stroke-dashoffset: 0;`;
+      svgPath.attr('style', mOffset + svgPath.attr('style'));
+    }
   }
 
-  // DEBUG code, DO NOT REMOVE
-  // adds a red circle at each edge coordinate
+  // MC Special
+  svgPath.attr('data-edge', true);
+  svgPath.attr('data-et', 'edge');
+  svgPath.attr('data-id', edge.id);
+  svgPath.attr('data-points', pointsStr);
+  // Add data attributes for neo look support
+  svgPath.attr('data-look', handleUndefinedAttr(edge.look));
+  // DEBUG code, adds a red circle at each edge coordinate
   // cornerPoints.forEach((point) => {
   //   elem
   //     .append('circle')
@@ -619,12 +870,23 @@ export const insertEdge = function (elem, edge, clusterDb, diagramType, startNod
   //     .attr('cx', point.x)
   //     .attr('cy', point.y);
   // });
+  if (edge.showPoints) {
+    lineData.forEach((point) => {
+      elem
+        .append('circle')
+        .style('stroke', 'red')
+        .style('fill', 'red')
+        .attr('r', 1)
+        .attr('cx', point.x)
+        .attr('cy', point.y);
+    });
+  }
   // lineData.forEach((point) => {
   //   elem
   //     .append('circle')
-  //     .style('stroke', 'blue')
-  //     .style('fill', 'blue')
-  //     .attr('r', 3)
+  //     .style('stroke', 'red')
+  //     .style('fill', 'red')
+  //     .attr('r', 1)
   //     .attr('cx', point.x)
   //     .attr('cy', point.y);
   // });
@@ -642,7 +904,13 @@ export const insertEdge = function (elem, edge, clusterDb, diagramType, startNod
   log.info('arrowTypeStart', edge.arrowTypeStart);
   log.info('arrowTypeEnd', edge.arrowTypeEnd);
 
-  addEdgeMarkers(svgPath, edge, url, id, diagramType, strokeColor);
+  const useMargin = !animatedEdge && edge?.look === 'neo';
+  addEdgeMarkers(svgPath, edge, url, diagramId, diagramType, useMargin, strokeColor);
+  const midIndex = Math.floor(points.length / 2);
+  const point = points[midIndex];
+  if (!utils.isLabelCoordinateInPath(point, svgPath.attr('d'))) {
+    pointsHasChanged = true;
+  }
 
   let paths = {};
   if (pointsHasChanged) {
@@ -651,3 +919,134 @@ export const insertEdge = function (elem, edge, clusterDb, diagramType, startNod
   paths.originalPath = edge.points;
   return paths;
 };
+
+/**
+ * Generates SVG path data with rounded corners from an array of points.
+ * @param {Array} points - Array of points in the format [{x: Number, y: Number}, ...]
+ * @param {Number} radius - The radius of the rounded corners
+ * @returns {String} - SVG path data string
+ */
+export function generateRoundedPath(points, radius) {
+  if (points.length < 2) {
+    return '';
+  }
+
+  let path = '';
+  const size = points.length;
+  const epsilon = 1e-5;
+
+  for (let i = 0; i < size; i++) {
+    const currPoint = points[i];
+    const prevPoint = points[i - 1];
+    const nextPoint = points[i + 1];
+
+    if (i === 0) {
+      // Move to the first point
+      path += `M${currPoint.x},${currPoint.y}`;
+    } else if (i === size - 1) {
+      // Last point, draw a straight line to the final point
+      path += `L${currPoint.x},${currPoint.y}`;
+    } else {
+      // Calculate vectors for incoming and outgoing segments
+      const dx1 = currPoint.x - prevPoint.x;
+      const dy1 = currPoint.y - prevPoint.y;
+      const dx2 = nextPoint.x - currPoint.x;
+      const dy2 = nextPoint.y - currPoint.y;
+
+      const len1 = Math.hypot(dx1, dy1);
+      const len2 = Math.hypot(dx2, dy2);
+
+      // Prevent division by zero
+      if (len1 < epsilon || len2 < epsilon) {
+        path += `L${currPoint.x},${currPoint.y}`;
+        continue;
+      }
+
+      // Normalize the vectors
+      const nx1 = dx1 / len1;
+      const ny1 = dy1 / len1;
+      const nx2 = dx2 / len2;
+      const ny2 = dy2 / len2;
+
+      // Calculate the angle between the vectors
+      const dot = nx1 * nx2 + ny1 * ny2;
+      // Clamp the dot product to avoid numerical issues with acos
+      const clampedDot = Math.max(-1, Math.min(1, dot));
+      const angle = Math.acos(clampedDot);
+
+      // Skip rounding if the angle is too small or too close to 180 degrees
+      if (angle < epsilon || Math.abs(Math.PI - angle) < epsilon) {
+        path += `L${currPoint.x},${currPoint.y}`;
+        continue;
+      }
+
+      // Calculate the distance to offset the control point
+      const cutLen = Math.min(radius / Math.sin(angle / 2), len1 / 2, len2 / 2);
+
+      // Calculate the start and end points of the curve
+      const startX = currPoint.x - nx1 * cutLen;
+      const startY = currPoint.y - ny1 * cutLen;
+      const endX = currPoint.x + nx2 * cutLen;
+      const endY = currPoint.y + ny2 * cutLen;
+
+      // Draw the line to the start of the curve
+      path += `L${startX},${startY}`;
+
+      // Draw the quadratic Bezier curve
+      path += `Q${currPoint.x},${currPoint.y} ${endX},${endY}`;
+    }
+  }
+
+  return path;
+}
+// Helper function to calculate delta and angle between two points
+function calculateDeltaAndAngle(point1, point2) {
+  if (!point1 || !point2) {
+    return { angle: 0, deltaX: 0, deltaY: 0 };
+  }
+  const deltaX = point2.x - point1.x;
+  const deltaY = point2.y - point1.y;
+  const angle = Math.atan2(deltaY, deltaX);
+  return { angle, deltaX, deltaY };
+}
+
+// Function to adjust the first and last points of the points array
+export function applyMarkerOffsetsToPoints(points, edge) {
+  // Copy the points array to avoid mutating the original data
+  const newPoints = points.map((point) => ({ ...point }));
+
+  // Handle the first point (start of the edge)
+  if (points.length >= 2 && markerOffsets[edge.arrowTypeStart]) {
+    const offsetValue = markerOffsets[edge.arrowTypeStart];
+
+    const point1 = points[0];
+    const point2 = points[1];
+
+    const { angle } = calculateDeltaAndAngle(point1, point2);
+
+    const offsetX = offsetValue * Math.cos(angle);
+    const offsetY = offsetValue * Math.sin(angle);
+
+    newPoints[0].x = point1.x + offsetX;
+    newPoints[0].y = point1.y + offsetY;
+  }
+
+  // Handle the last point (end of the edge)
+  const n = points.length;
+  if (n >= 2 && markerOffsets[edge.arrowTypeEnd]) {
+    const offsetValue = markerOffsets[edge.arrowTypeEnd];
+
+    const point1 = points[n - 1];
+    const point2 = points[n - 2];
+
+    const { angle } = calculateDeltaAndAngle(point2, point1);
+
+    const offsetX = offsetValue * Math.cos(angle);
+    const offsetY = offsetValue * Math.sin(angle);
+
+    newPoints[n - 1].x = point1.x - offsetX;
+    newPoints[n - 1].y = point1.y - offsetY;
+  }
+
+  return newPoints;
+}
